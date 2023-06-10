@@ -1,0 +1,1213 @@
+# -*- coding: utf-8 -*-
+'''
+.. _module_mc_utils:
+
+mc_utils / Some usefull small tools
+====================================
+
+
+
+'''
+
+# Import salt libs
+from pprint import pformat
+import copy
+import cProfile
+import crypt
+import collections
+import datetime
+import hashlib
+import logging
+import os
+import pstats
+import re
+
+from salt.config import master_config, minion_config
+from salt.exceptions import SaltException
+import salt.utils
+import salt.utils.dictupdate
+import salt.utils.network
+from salt.utils.pycrypto import secure_password
+from salt.utils.odict import OrderedDict
+import salt.loader
+from salt.ext import six as six
+from mc_states import api
+import mc_states.api
+
+_CACHE = {'mid': None}
+_default_marker = object()
+_marker = object()
+log = logging.getLogger(__name__)
+
+
+def hash(string, typ='md5', func='hexdigest'):
+    '''
+    Return the hash of a string
+    CLI Examples::
+
+        salt-call --local mc_utils.hash foo
+        salt-call --local mc_utils.hash foo md5
+        salt-call --local mc_utils.hash foo sha1
+        salt-call --local mc_utils.hash foo sha224
+        salt-call --local mc_utils.hash foo sha256
+        salt-call --local mc_utils.hash foo sha384
+        salt-call --local mc_utils.hash foo sha512
+
+    '''
+    if func not in ['hexdigest', 'digest']:
+        func = 'hexdigest'
+
+    if typ not in [
+        'md5', 'sha1', 'sha224', 'sha256', 'sha384', 'sha512'
+    ]:
+        raise TypeError('{0} is not valid hash'.format(typ))
+    return getattr(getattr(hashlib, typ)(string), func)()
+
+
+def uniquify(*a, **kw):
+    return api.uniquify(*a, **kw)
+
+
+def odict(instance=True):
+    if instance:
+        return OrderedDict()
+    return OrderedDict
+
+
+def local_minion_id(force=False):
+    '''
+    search in running config root
+    then in well known config mastersalt root
+    then in well known config salt root
+    then use regular salt function
+    '''
+    mid = _CACHE['mid']
+    if mid and not force:
+        return mid
+    paths = api.uniquify([
+        __opts__['config_dir'], '/etc/mastersalt', '/etc/salt'])
+    for path in paths:
+        for cfgn, fun in OrderedDict(
+            [('master', master_config),
+             ('minion', minion_config)]
+        ).items():
+            cfg = os.path.join(path, cfgn)
+            if os.path.exists(cfg):
+                try:
+                    cfgo = fun(cfg)
+                    mid = cfgo.get('id', None)
+                    if mid.endswith('_master'):
+                        mid = None
+                except Exception:
+                    pass
+            if mid:
+                break
+        if mid:
+            break
+    # normally we should never hit this case as salt generates
+    # internally during config parsing the minion id
+    if not mid:
+        mid = salt.utils.network.generate_minion_id()
+    _CACHE['mid'] = mid
+    return mid
+
+
+def magicstring(thestr):
+    """
+    Convert any string to UTF-8 ENCODED one
+    """
+    return api.magicstring(thestr)
+
+
+def generate_stored_password(key, length=None, force=False, value=None):
+    '''
+    Generate and store a password.
+    At soon as one is stored with a specific key, it will never be renegerated
+    unless you set force to true.
+    '''
+    if length is None:
+        length = 16
+    reg = __salt__[
+            'mc_macros.get_local_registry'](
+                'local_passwords', registry_format='pack')
+    sav = False
+    if not key in reg:
+        sav = True
+    rootpw = reg.setdefault(key, __salt__['mc_utils.generate_password'](length))
+    if force or not rootpw:
+        rootpw = __salt__['mc_utils.generate_password'](length)
+        sav = True
+    if value is not None:
+        rootpw = value
+    reg[key] = rootpw
+    __salt__['mc_macros.update_local_registry'](
+        'local_passwords', reg, registry_format='pack')
+    return rootpw
+
+
+def generate_password(length=None):
+    if length is None:
+        length = 16
+    return secure_password(length)
+
+
+class _CycleError(Exception):
+    '''.'''
+    def __init__(self, msg, new=None, original_dict=None, *args, **kwargs):
+        super(_CycleError, self).__init__(msg, *args, **kwargs)
+        self.new = new
+        self.original_dict = original_dict
+
+
+def deepcopy(arg):
+    return copy.deepcopy(arg)
+
+
+
+def update_no_list(dest, upd, recursive_update=True):
+    '''
+    Recursive version of the default dict.update
+
+    Merges upd recursively into dest
+    But instead of merging lists, it overrides them from target dict
+    '''
+    if (not isinstance(dest, collections.Mapping)) \
+            or (not isinstance(upd, collections.Mapping)):
+        raise TypeError('Cannot update using non-dict types in dictupdate.update()')
+    updkeys = list(upd.keys())
+    if not set(list(dest.keys())) & set(updkeys):
+        recursive_update = False
+    if recursive_update:
+        for key in updkeys:
+            val = upd[key]
+            try:
+                dest_subkey = dest.get(key, None)
+            except AttributeError:
+                dest_subkey = None
+            if isinstance(dest_subkey, collections.Mapping) \
+                    and isinstance(val, collections.Mapping):
+                ret = update_no_list(dest_subkey, val)
+                dest[key] = ret
+            else:
+                dest[key] = upd[key]
+        return dest
+    else:
+        try:
+            dest.update(upd)
+        except AttributeError:
+            # this mapping is not a dict
+            for k in upd:
+                dest[k] = upd[k]
+        return dest
+
+
+
+def dictupdate(dict1, dict2):
+    '''
+    Merge two dictionnaries recursively
+
+    test::
+
+      salt '*' mc_utils.dictupdate '{foobar:
+                  {toto: tata, toto2: tata2},titi: tutu}'
+                  '{bar: toto, foobar: {toto2: arg, toto3: arg2}}'
+      ----------
+      bar:
+          toto
+      foobar:
+          ----------
+          toto:
+              tata
+          toto2:
+              arg
+          toto3:
+              arg2
+      titi:
+          tutu
+    '''
+    if not isinstance(dict1, dict):
+        raise SaltException(
+            'mc_utils.dictupdate 1st argument is not a dictionnary!')
+    if not isinstance(dict2, dict):
+        raise SaltException(
+            'mc_utils.dictupdate 2nd argument is not a dictionnary!')
+    return update_no_list(dict1, dict2)
+
+
+def copy_dictupdate(dict1, dict2):
+    '''
+    Similar to dictupdate but with deepcopy of two
+    merged dicts first.
+    '''
+    return dictupdate(copy.deepcopy(dict1),
+                      copy.deepcopy(dict2))
+
+
+def unresolved(data):
+    ret = None
+    if isinstance(data, six.string_types):
+        if '{' in data and '}' in data:
+            ret = True
+        else:
+            ret = False
+    elif isinstance(data, dict):
+        for k, val in six.iteritems(data):
+            ret1 = unresolved(k)
+            ret2 = unresolved(val)
+            ret = ret1 or ret2
+            if ret:
+                break
+    elif isinstance(data, (list, set)):
+        for val in data:
+            ret = unresolved(val)
+            if ret:
+                break
+    return ret
+
+
+def _str_resolve(new, original_dict=None, this_call=0, topdb=False):
+
+    '''
+    low level and optimized call to format_resolve
+    '''
+    init_new = new
+    # do not directly call format to handle keyerror in original mapping
+    # where we may have yet keyerrors
+    if isinstance(original_dict, dict):
+        for k in original_dict:
+            reprk = k
+            if not isinstance(reprk, six.string_types):
+                reprk = '{0}'.format(k)
+            subst = '{' + reprk + '}'
+            if subst in new:
+                subst_val = original_dict[k]
+                if isinstance(subst_val, (list, dict)):
+                    inner_new = format_resolve(
+                        subst_val, original_dict,
+                        this_call=this_call, topdb=topdb)
+                    # composed, we take the repr
+                    if new != subst:
+                        new = new.replace(subst, str(inner_new))
+                    # no composed value, take the original list
+                    else:
+                        new = inner_new
+                else:
+                    if new != subst_val:
+                        new = new.replace(subst, str(subst_val))
+            if not unresolved(new):
+                # new value has been totally resolved
+                break
+    return new, new != init_new
+
+
+def str_resolve(new, original_dict=None, this_call=0, topdb=False):
+    return _str_resolve(
+        new, original_dict=original_dict, this_call=this_call, topdb=topdb)[0]
+
+
+def _format_resolve(value,
+                    original_dict=None,
+                    this_call=0,
+                    topdb=False,
+                    retry=None,
+                    **kwargs):
+    '''
+    low level and optimized call to format_resolve
+    '''
+    if not original_dict:
+        original_dict = OrderedDict()
+
+    if this_call == 0:
+        if not original_dict and isinstance(value, dict):
+            original_dict = value
+
+    changed = False
+
+    if kwargs:
+        original_dict.update(kwargs)
+
+    if not unresolved(value):
+        return value, False
+
+    if isinstance(value, dict):
+        new = type(value)()
+        for key, v in value.items():
+            val, changed_ = _format_resolve(v, original_dict, topdb=topdb)
+            if changed_:
+                changed = changed_
+            new[key] = val
+    elif isinstance(value, (list, tuple)):
+        new = type(value)()
+        for v in value:
+            val, changed_ = _format_resolve(v, original_dict, topdb=topdb)
+            if changed_:
+                changed = changed_
+            new = new + type(value)([val])
+    elif isinstance(value, six.string_types):
+        new, changed_ = _str_resolve(value, original_dict, topdb=topdb)
+        if changed_:
+            changed = changed_
+    else:
+        new = value
+
+    if retry is None:
+        retry = unresolved(new)
+
+    while retry and (this_call < 100):
+        new, changed = _format_resolve(new,
+                                       original_dict,
+                                       this_call=this_call,
+                                       retry=False,
+                                       topdb=topdb)
+        if not changed:
+            retry = False
+        this_call += 1
+    return new, changed
+
+
+def format_resolve(value,
+                   original_dict=None,
+                   this_call=0, topdb=False, **kwargs):
+
+    '''
+    Resolve a dict of formatted strings, mappings & list to a valued dict
+    Please also read the associated test::
+
+        {"a": ["{b}", "{c}", "{e}"],
+         "b": 1,
+         "c": "{d}",
+         "d": "{b}",
+         "e": "{d}",
+        }
+
+        ====>
+        {"a": ["1", "1", "{e}"],
+         "b": 1,
+         "c": "{d}",
+         "d": "{b}",
+         "e": "{d}",
+        }
+
+    '''
+    return _format_resolve(value,
+                           original_dict=original_dict,
+                           this_call=this_call,
+                           topdb=topdb,
+                           **kwargs)[0]
+
+
+def is_a_str(value):
+    '''
+    is the value a stirng
+    '''
+    return isinstance(value, six.string_types)
+
+
+def is_a_bool(value):
+    '''
+    is the value a bool
+    '''
+    return isinstance(value, bool)
+
+
+def is_a_int(value):
+    '''
+    is the value an int
+    '''
+    return isinstance(value, int)
+
+
+def is_a_float(value):
+    '''
+    is the value a float
+    '''
+    return isinstance(value, float)
+
+
+def is_a_complex(value):
+    '''
+    is the value a complex
+    '''
+    return isinstance(value, complex)
+
+
+def is_a_long(value):
+    '''
+    is the value a long
+    '''
+    return isinstance(value, long)
+
+
+def is_a_number(value):
+    '''
+    is the value a number
+    '''
+    return (
+        is_a_int(value) or
+        is_a_float(value) or
+        is_a_complex(value) or
+        is_a_long(value)
+    )
+
+
+def is_a_set(value):
+    '''
+    is the value a set
+    '''
+    return isinstance(value, set)
+
+
+def is_a_tuple(value):
+    '''
+    is the value a tuple
+    '''
+    return isinstance(value, tuple)
+
+
+def is_a_list(value):
+    '''
+    is the value a list
+    '''
+    return isinstance(value, list)
+
+
+def is_a_dict(value):
+    '''
+    is the value a dict
+    '''
+    return isinstance(value, dict)
+
+
+def is_iter(value):
+    '''
+    is the value iterable (list, set, dict tuple)
+    '''
+    return (
+        is_a_list(value) or
+        is_a_dict(value) or
+        is_a_tuple(value) or
+        is_a_set(value)
+    )
+
+
+def traverse_dict(data, key, delimiter=salt.utils.DEFAULT_TARGET_DELIM):
+    '''
+    Handle the fact to traverse dicts with '.' as it was an old
+    default and makina-states relies a lot on it
+
+    This restore the old behavior of something that can be traversed
+
+    makina-states.foo:
+        bar:
+            c: true
+
+    can be traversed with makina-states.foo.bar.c
+    '''
+    delimiters = uniquify([delimiter, salt.utils.DEFAULT_TARGET_DELIM,
+                           ':', '.'])
+    ret = dv = '_|-'
+    for dl in delimiters:
+        for cdl in reversed(delimiters):
+            ret = salt.utils.traverse_dict(data, key, dv, delimiter=dl)
+            if ret != dv:
+                return ret
+            if cdl in key and dl not in key:
+                nkey = key.replace(cdl, dl)
+                ret = salt.utils.traverse_dict(data, nkey, dv, delimiter=dl)
+                if ret != dv:
+                    return ret
+                # if the dict is not at the end, we try to progressivily
+                # combine the delimiters from the start of the key
+                # a.c.d.e will be tested then for
+                # a.c:d:e will be tested then for
+                # a.c.d:e will be tested then for
+                # we do not test the last element as it is the exact key !
+                for i in range(key.count(cdl)-1):
+                    dkey = nkey.replace(dl, cdl, i+1)
+                    ret = salt.utils.traverse_dict(
+                        data, dkey, dv, delimiter=dl)
+                    if ret != dv:
+                        return ret
+    return ret
+
+
+def uncached_get(key, default='',
+                 local_registry=None, registry_format='pack',
+                 delimiter=salt.utils.DEFAULT_TARGET_DELIM):
+    '''
+    Same as 'config.get' but with different retrieval order.
+
+    This routine traverses these data stores in this order:
+
+        - Local minion config (opts)
+        - Minion's pillar
+        - Dict:
+            - passed in local_registry argument
+            - or automaticly loaded global registries
+        - Minion's grains
+        - Master config
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' mc_utils.get pkg:apache
+
+    '''
+    _s, _g, _p, _o = __salt__, __grains__, __pillar__, __opts__
+    if local_registry is None:
+        for reg, pref in api._LOCAL_PREFS:
+            if key.startswith(pref):
+                local_registry = reg
+                break
+    if (
+        isinstance(local_registry, basestring) and
+        local_registry not in ['localsettings']
+    ):
+        local_registry = _s['mc_macros.get_local_registry'](
+            local_registry, registry_format=registry_format)
+    else:
+        local_registry = None
+    ret = traverse_dict(_o, key, delimiter=delimiter)
+    if ret != '_|-':
+        return ret
+    ret = traverse_dict(_p, key, delimiter=delimiter)
+    if ret != '_|-':
+        return ret
+    if local_registry is not None:
+        ret = traverse_dict(local_registry, key, delimiter=delimiter)
+        if ret != '_|-':
+            return ret
+    ret = traverse_dict(_g, key, delimiter=delimiter)
+    if ret != '_|-':
+        return ret
+    ret = traverse_dict(_p.get('master', {}), key, delimiter=delimiter)
+    if ret != '_|-':
+        return ret
+    return default
+
+
+def cached_get(key, default='',
+               local_registry=None, registry_format='pack',
+               delimiter=salt.utils.DEFAULT_TARGET_DELIM, ttl=60):
+    cache_key = 'mc_utils_get.{0}{1}{2}{3}'.format(key,
+                                                   local_registry,
+                                                   registry_format,
+                                                   delimiter)
+    return __salt__['mc_utils.memoize_cache'](
+        uncached_get,
+        [key],
+        {'default': default,
+         'local_registry': local_registry,
+         'registry_format': registry_format,
+         'delimiter': delimiter},
+        cache_key,
+        ttl)
+
+
+get = uncached_get
+
+
+def get_uniq_keys_for(prefix):
+    '''
+    Return keys for prefix:
+
+        - if prefix is in conf
+        - All other keys of depth + 1
+
+    With makina.foo prefix:
+
+        - returns makina.foo
+        - returns makina.foo.1
+        - dont returns makina.foo.1.1
+        - dont returns makina
+        - dont returns makina.other
+    '''
+
+    keys = OrderedDict()
+    for mapping in (__pillar__,
+                    __grains__):
+        skeys = []
+        for k in mapping:
+            if k.startswith(prefix):
+                testn = k[len(prefix):]
+                try:
+                    if testn.index('.') < 2:
+                        skeys.append(k)
+                except (IndexError, ValueError):
+                    continue
+        skeys.sort()
+        for k in skeys:
+            keys[k] = mapping[k]
+    return keys
+
+
+def defaults(prefix,
+             datadict,
+             ignored_keys=None,
+             overridden=None,
+             noresolve=False,
+             firstcall=True):
+    '''
+    Magic defaults settings configuration getter
+
+    - Get the "prefix" value from the configuration (pillar/grain)
+    - Then overrides or append to it with the corresponding
+      key in the given "datadict" if value is a dict or a list.
+
+      - If we get from pillar/grains/local from the curent key in the form:
+        "{prefix}-overrides: it overrides totally the original value.
+      - if the datadict contains a key "{prefix}-append and
+        the value is a list, it appends to the original value
+
+    - If the datadict contains a key "{prefix}":
+        - If a list: override to the list the default list in conf
+        - Elif a dict: update the default dictionnary with the one in conf
+        - Else take that as a value if the value is not a mapping or a list
+    '''
+    if not ignored_keys:
+        ignored_keys = []
+    if firstcall:
+        global_pillar = copy.deepcopy(
+            __salt__['mc_utils.get'](prefix))
+        if isinstance(global_pillar, dict):
+            for k in [a for a in ignored_keys if a in global_pillar]:
+                if k in global_pillar:
+                    del global_pillar[k]
+            datadict = __salt__['mc_utils.dictupdate'](datadict, global_pillar)
+
+    # if we overrided only keys of a dict
+    # but this dict is an empty dict in the default mapping
+    # be sure to load them inside this dict
+    items = get_uniq_keys_for(prefix)
+    dotedprefix = '{0}.'.format(prefix)
+    for fullkey in items:
+        key = dotedprefix.join(fullkey.split(dotedprefix)[1:])
+        val = items[fullkey]
+        if isinstance(datadict, dict):
+            curval = datadict.get(key, None)
+            if isinstance(curval, dict):
+                val = __salt__['mc_utils.dictupdate'](curval, val)
+            elif isinstance(curval, (list, set)):
+                if val is not None:
+                    curval.extend(val)
+                val = curval
+            datadict[key] = val
+    if overridden is None:
+        overridden = OrderedDict()
+    if prefix not in overridden:
+        overridden[prefix] = OrderedDict()
+    pkeys = OrderedDict()
+    for a in datadict:
+        if a not in ignored_keys:
+            to_unicode = False
+            for i in prefix, a:
+                if isinstance(i, unicode):
+                    to_unicode = True
+                    break
+            k = '{0}.{1}'.format(magicstring(prefix), magicstring(a))
+            if to_unicode:
+                k = k.decode('utf-8')
+            pkeys[a] = (k, datadict[a])
+    for key, value_data in pkeys.items():
+        value_key, default_value = value_data
+        # special key to completly override the dictionnary
+        avalue = _default_marker
+        value = __salt__['mc_utils.get'](
+            value_key + "-overrides", _default_marker)
+        if isinstance(default_value, list):
+            avalue = __salt__['mc_utils.get'](
+                value_key + "-append", _default_marker)
+        if value is not _default_marker:
+            overridden[prefix][key] = value
+        else:
+            value = __salt__['mc_utils.get'](value_key, _default_marker)
+        if not isinstance(default_value, list) and value is _default_marker:
+            value = default_value
+        if isinstance(default_value, list):
+            if key in overridden[prefix]:
+                value = overridden[prefix][key]
+            else:
+                nvalue = default_value[:]
+                if (
+                    value and
+                    (value != nvalue) and
+                    (value is not _default_marker)
+                ):
+                    if nvalue is None:
+                        nvalue = []
+                    nvalue.extend(value)
+                value = nvalue
+            if isinstance(avalue, list):
+                value.extend(avalue)
+        elif isinstance(value, dict):
+            # recurvive and conservative dictupdate
+            ndefaults = defaults(value_key,
+                                 value,
+                                 overridden=overridden,
+                                 noresolve=noresolve,
+                                 firstcall=firstcall)
+                                 # firstcall=False)
+            if overridden[value_key]:
+                for k, value in overridden[value_key].items():
+                    default_value[k] = value
+            # override specific keys values handle:
+            # eg: makina-states.services.firewall.params.RESTRICTED_SSH = foo
+            # eg: makina-states.services.firewall.params:
+            #        foo: var
+            for k, subvalue in get_uniq_keys_for(value_key).items():
+                ndefaults[k.split('{0}.'.format(value_key))[1]] = subvalue
+            value = __salt__['mc_utils.dictupdate'](default_value, ndefaults)
+        datadict[key] = value
+        for k, value in overridden[prefix].items():
+            datadict[k] = value
+    if not noresolve:
+        datadict = format_resolve(datadict)
+    return datadict
+
+
+def sanitize_kw(kw):
+    ckw = copy.deepcopy(kw)
+    for k in kw:
+        if ('__pub_' in k) and (k in ckw):
+            ckw.pop(k)
+    return ckw
+
+
+def salt_root():
+    '''get salt root from either pillar or opts (minion or master)'''
+    salt = __salt__['mc_salt.settings']()
+    return salt['c']['o']['saltRoot']
+
+
+def msr():
+    '''get salt root from either pillar or opts (minion or master)'''
+    salt = __salt__['mc_salt.settings']()
+    return salt['c']['o']['msr']
+
+
+def remove_stuff_from_opts(__opts):
+    opts = __context__.setdefault('mc_opts', __opts)
+    if opts is not __opts:
+        for k in [a for a in __opts]:
+            if k not in opts:
+                __opts.pop(k, None)
+            elif opts[k] != __opts[k]:
+                __opts[k] = opts[k]
+    __context__.pop('mc_opts', None)
+    return __opts
+
+
+def add_stuff_to_opts(__opts):
+    opts = __context__.setdefault('mc_opts', __opts)
+    if opts is __opts:
+        # UGLY HACK for the lazyloader
+        old_opts = copy.deepcopy(__opts)
+        try:
+            __opts['grains'] = __grains__
+        except Exception:
+            pass
+        try:
+            __opts['pillar'] = __pillar__
+        except Exception:
+            pass
+        __context__['mc_opts'] = old_opts
+    return __opts
+
+
+def sls_load(sls, get_inner=False):
+    if not os.path.exists(sls):
+        raise OSError('does not exists: {0}'.format(sls))
+    try:
+        add_stuff_to_opts(__opts__)
+        jinjarend = salt.loader.render(__opts__, __salt__)
+        data_l = salt.template.compile_template(
+            sls, jinjarend, __opts__['renderer'], 'base')
+    finally:
+        remove_stuff_from_opts(__opts__)
+    if isinstance(data_l, (dict, list, set)) and get_inner:
+        if len(data_l) == 1:
+            if isinstance(data_l, dict):
+                for key in six.iterkeys(data_l):
+                    data_l = data_l[key]
+                    break
+            else:
+                data_l = data_l[0]
+    return data_l
+
+
+def file_read(fic):
+    '''
+    read the content a file
+    '''
+    data = ''
+    with open(fic, 'r') as f:
+        data = f.read()
+    return data
+
+
+def unix_crypt(passwd):
+    '''Encrypt the stringed password in the unix crypt format (/etc/shadow)'''
+    return crypt.crypt(passwd, '$6$SALTsalt$')
+
+
+def sls_available(sls, pillar=True):
+    ret = True
+    if pillar:
+        root = __opts__['pillar_roots']['base'][0]
+    else:
+        root = __opts__['pillar_roots']['base'][0]
+    fp = os.path.join(root, sls.replace('.', '/') + '.sls')
+    try:
+        ret = os.path.exists(fp)
+    except OSError:
+        ret = False
+    return ret
+
+
+def indent(tstring, spaces=16, char=' '):
+    data = ''
+    for ix, i in enumerate(tstring.split('\n')):
+        if ix > 0:
+            data += char * spaces
+        data += i + '\n'
+    return data
+
+
+def profile(func, *args, **kw):
+    if not __opts__.get('ms_profile_enabled', False):
+        raise Exception('Profile not enabled')
+    kw = copy.deepcopy(kw)
+    for i in [a for a in kw if a.startswith('__')]:
+        kw.pop(i, None)
+    pr = cProfile.Profile()
+    pr.enable()
+    ret = __salt__[func](*args, **kw)
+    pr.disable()
+    if not os.path.isdir('/tmp/stats'):
+        os.makedirs('/tmp/stats')
+    ficp = '/tmp/stats/{0}.pstats'.format(func)
+    fico = '/tmp/stats/{0}.dot'.format(func)
+    ficcl = '/tmp/stats/{0}.calls.stats'.format(func)
+    ficn = '/tmp/stats/{0}.cumulative.stats'.format(func)
+    fict = '/tmp/stats/{0}.total.stats'.format(func)
+    for i in [ficp, fico, ficn, fict, ficcl]:
+        if os.path.exists(i):
+            os.unlink(i)
+    pr.dump_stats(ficp)
+    with open(ficn, 'w') as fic:
+        ps = pstats.Stats(
+            pr, stream=fic).sort_stats('cumulative')
+        ps.print_stats()
+    with open(ficcl, 'w') as fic:
+        ps = pstats.Stats(
+            pr, stream=fic).sort_stats('calls')
+        ps.print_stats()
+    with open(fict, 'w') as fic:
+        ps = pstats.Stats(
+            pr, stream=fic).sort_stats('tottime')
+        ps.print_stats()
+    os.system(
+        '/srv/mastersalt/makina-states/bin/pyprof2calltree '
+        '-i {0} -o {1}'.format(ficp, fico))
+    return ret, ficp, fico, ficn, ficcl, fict
+
+
+def manage_file(name, **kwargs):
+    '''
+    Easier wrapper to file.manage_file
+    '''
+    for i in [a for a in kwargs if '__' in a]:
+        kwargs.pop(i, None)
+    log.error(kwargs.keys())
+    kwargs.setdefault('mode', '755')
+    kwargs.setdefault('backup', None)
+    kwargs.setdefault('contents', None)
+    kwargs.setdefault('makedirs', True)
+    kwargs.setdefault('user', 'root')
+    kwargs.setdefault('group', 'root')
+    kwargs.setdefault('saltenv', 'base')
+    kwargs.setdefault('ret', None)
+    kwargs.setdefault('sfn', None)
+    kwargs.setdefault('source', None)
+    kwargs.setdefault('source_sum', None)
+    return __salt__['file.manage_file'](name, **kwargs)
+
+
+def _outputters(outputter=None):
+    outputters = salt.loader.outputters(__opts__)
+    if outputter:
+        return outputters[outputter]
+    return outputters
+
+
+def output(mapping, raw=False, outputter='highstate'):
+    '''
+    This return a formatted output
+    '''
+    color = __opts__.get('color', None)
+    slashre = re.compile('[\\\]+', re.S | re.U | re.X)
+    __opts__['color'] = not raw
+    try:
+        if isinstance(mapping, dict) and (outputter == 'highstate'):
+            ret = _outputters(outputter)({'local': mapping})
+        else:
+            ret = _outputters(outputter)(mapping)
+    except MemoryError:
+        # try to print out something in RAW MODE
+        mmapping = copy.deepcopy(mapping)
+        # ugly hack inside:
+        # on error while display message
+        # with recursive \\, just try to strip them
+        # and reuse the outputter
+        try:
+            if not isinstance(mmapping, dict):
+                raise ValueError('not a dict, trying raw output')
+            for state in [
+                i for i in mmapping
+                if isinstance(mmapping[i], dict)
+            ]:
+                if not isinstance(mmapping[state], dict):
+                    continue
+                for k in [
+                    j for j in mmapping[state]
+                    if isinstance(mapping[state][j], basestring)
+                ]:
+                    mmapping[state][k] = slashre.sub('', mmapping[state][k])
+            if outputter == 'highstate':
+                ret = _outputters(outputter)({'local': mmapping})
+            else:
+                ret = _outputters(outputter)(mmapping)
+        except Exception:
+            # try to print out something in RAW MODE
+            # without outputter formatting
+            try:
+                ret = pformat(mmapping)
+            except Exception:
+                try:
+                    ret = u"{0}".format(mmapping)
+                except Exception:
+                    try:
+                        ret = "{0}".format(mmapping)
+                    except Exception:
+                        raise
+    __opts__['color'] = color
+    return ret
+
+
+def is_this_lxc():
+    container = get_container(1)
+    if container not in ['MAIN_HOST']:
+        return True
+    return False
+
+
+def get_container(pid):
+    lxc = 'MAIN_HOST'
+    cg = '/proc/{0}/cgroup'.format(pid)
+    # lxc ?
+    if os.path.isfile(cg):
+        with open(cg) as fic:
+            content = fic.read()
+            if 'lxc' in content:
+                # 9:blkio:NAME
+                lxc = content.split('\n')[0].split(':')[-1]
+    if '/lxc' in lxc:
+        lxc = lxc.split('/lxc/', 1)[1]
+    return lxc
+
+
+def filter_host_pids(pids):
+    thishost = get_container(1)
+    return [a for a in pids
+            if get_container(a) == thishost]
+
+
+def cache_kwargs(*args, **kw):
+    shared = {'__opts__': __opts__, '__salt__': __salt__}
+    to_delete = [i for i in kw
+                 if i.startswith('__') and i not in shared]
+    dc = len(to_delete)
+    for i in shared:
+        if i not in kw:
+            dc = True
+    if dc:
+        kw = copy.deepcopy(kw)
+    [kw.pop(i, None) for i in to_delete]
+    for i, val in six.iteritems(shared):
+        if not kw.get(i):
+            kw[i] = val
+    return kw
+
+
+def memoize_cache(*args, **kw):
+    '''
+    Wrapper for :meth:`~mc_states.api.memoize_cache` to set __opts__
+
+    CLI Examples::
+
+        mastersalt-call -lall mc_pillar.memoize_cache test.ping
+
+    '''
+    return api.memoize_cache(*args, **cache_kwargs(*args, **kw))
+
+
+def test_cache(ttl=120):
+    '''.'''
+    def _do():
+        return "a"
+    cache_key = 'mc_utils.test_cache'
+    __salt__['mc_utils.memoize_cache'](_do, [], {}, cache_key, ttl)
+    ret = list_cache_keys()
+    remove_cache_entry(ret[0], debug=True)
+    return ret
+
+
+def remove_entry(*args, **kw):
+    '''
+    Wrapper for :meth:`~mc_states.api.remove_cache_entry` to set __opts__
+    '''
+    return mc_states.api.remove_entry(*args, **cache_kwargs(*args, **kw))
+
+
+def list_cache_keys(*args, **kw):
+    '''
+    Wrapper for :meth:`~mc_states.api.list_cache_keys` to set __opts__
+    '''
+    return mc_states.api.list_cache_keys(*args, **cache_kwargs(*args, **kw))
+
+
+def remove_cache_entry(*args, **kw):
+    '''
+    Wrapper for :meth:`~mc_states.api.remove_cache_entry` to set __opts__
+    '''
+    return mc_states.api.remove_cache_entry(*args, **cache_kwargs(*args, **kw))
+
+
+def get_mc_server(*args, **kw):
+    '''
+    Wrapper for :meth:`~mc_states.api.get_local_cache`
+    '''
+    return mc_states.api.get_mc_server(*args, **kw)
+
+
+def get_local_cache(*args):
+    '''
+    Wrapper for :meth:`~mc_states.api.get_local_cache`
+    '''
+    return mc_states.api.get_local_cache(*args)
+
+
+def register_memcache_first(pattern):
+    '''
+    Wrapper for :meth:`~mc_states.api.invalidate_memoize_cache` to set __opts__
+    '''
+    return mc_states.api.register_memcache_first(pattern)
+
+
+def invalidate_memoize_cache(*args, **kw):
+    '''
+    Wrapper for :meth:`~mc_states.api.invalidate_memoize_cache` to set __opts__
+    '''
+    return mc_states.api.invalidate_memoize_cache(*args,
+                                                  **cache_kwargs(*args, **kw))
+
+
+def purge_memoize_cache(*args, **kw):
+    '''
+    Wrapper for :meth:`~mc_states.api.invalidate_memoize_cache` to set __opts__
+    '''
+    return mc_states.api.purge_memoize_cache(*args,
+                                             **cache_kwargs(*args, **kw))
+
+
+def cache_check(*args, **kw):
+    '''
+    Wrapper for :meth:`~mc_states.api.invalidate_memoize_cache` to set __opts__
+    '''
+    return mc_states.api.cache_check(*args, **cache_kwargs(*args, **kw))
+
+
+def yencode(*args, **kw):
+    '''
+    Retro compat to :meth:`mc_states.modules.mc_dump.yencode`
+    '''
+    return __salt__['mc_dumper.yencode'](*args, **kw)
+
+
+def cyaml_load(*args, **kw):
+    '''
+    Retro compat to :meth:`mc_states.modules.mc_dump.cyaml_load`
+    '''
+    return __salt__['mc_dumper.cyaml_load'](*args, **kw)
+
+
+def yaml_load(*args, **kw):
+    '''
+    Retro compat to :meth:`mc_states.modules.mc_dump.yaml_load`
+    '''
+    return __salt__['mc_dumper.yaml_load'](*args, **kw)
+
+
+def yaml_dump(*args, **kw):
+    '''
+    Retro compat to :meth:`mc_states.modules.mc_dump.old_yaml_dump`
+    '''
+    return __salt__['mc_dumper.old_yaml_dump'](*args, **kw)
+
+
+def cyaml_dump(*args, **kw):
+    '''
+    Retro compat to :meth:`mc_states.modules.mc_dump.cyaml_dump`
+    '''
+    return __salt__['mc_dumper.cyaml_dump'](*args, **kw)
+
+
+def old_yaml_dump(*args, **kw):
+    '''
+    Retro compat to :meth:`mc_states.modules.mc_dump.old_yaml_dump`
+    '''
+    return __salt__['mc_dumper.old_yaml_dump'](*args, **kw)
+
+
+def nyaml_dump(*args, **kw):
+    '''
+    Retro compat to :meth:`mc_states.modules.mc_dump.yaml_dump`
+    '''
+    return __salt__['mc_dumper.yaml_dump'](*args, **kw)
+
+
+def iyaml_dump(*args, **kw):
+    '''
+    Retro compat to :meth:`mc_states.modules.mc_dump.iyaml_dump`
+    '''
+    return __salt__['mc_dumper.iyaml_dump'](*args, **kw)
+
+
+def msgpack_load(*args, **kw):
+    '''
+    Retro compat to :meth:`mc_states.modules.mc_dump.msgpack_load`
+    '''
+    return __salt__['mc_dumper.msgpack_load'](*args, **kw)
+
+
+def msgpack_dump(*args, **kw):
+    '''
+    Retro compat to :meth:`mc_states.modules.mc_dump.old_msgpack_dump`
+    '''
+    return __salt__[
+        'mc_dumper.msgpack_dump'](*args, **kw)
+
+
+def json_load(*args, **kw):
+    '''
+    Retro compat to :meth:`mc_states.modules.mc_dump.json_load`
+    '''
+    return __salt__['mc_dumper.json_load'](*args, **kw)
+
+
+def json_dump(*args, **kw):
+    '''
+    Retro compat to :meth:`mc_states.modules.mc_dump.old_json_dump`
+    '''
+    return __salt__['mc_dumper.json_dump'](*args, **kw)
